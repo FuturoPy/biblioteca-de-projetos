@@ -147,6 +147,9 @@
     border:none;border-radius:50%;width:18px;height:18px;font-size:11px;line-height:1;cursor:pointer;
   }
   .hint{font-size:0.72rem;color:#9a8c6a;margin-top:6px;}
+  .budget-bar{height:6px;border-radius:4px;background:#e6dcc2;margin-top:10px;overflow:hidden;}
+  .budget-bar-fill{height:100%;background:var(--brass);width:0%;transition:width .2s ease, background .2s ease;}
+  .budget-bar-fill.warn{background:var(--rust);}
 
   .status-msg{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--paper);padding:10px 20px;border-radius:6px;font-size:0.85rem;opacity:0;pointer-events:none;transition:opacity .25s ease;z-index:60;max-width:90vw;text-align:center;}
   .status-msg.show{opacity:1;}
@@ -260,7 +263,8 @@
         <input type="file" id="fImagens" accept="image/*" multiple>
       </label>
       <div class="thumbs" id="thumbsArea"></div>
-      <div class="hint">As imagens são redimensionadas automaticamente em boa qualidade para caber no acervo.</div>
+      <div class="budget-bar"><div class="budget-bar-fill" id="budgetBarFill"></div></div>
+      <div class="hint" id="budgetHint">As imagens são redimensionadas e comprimidas automaticamente para caber no acervo.</div>
     </div>
     <div class="field">
       <label for="fDesc">Notas / descrição</label>
@@ -304,7 +308,7 @@ const lightbox = document.getElementById('lightbox');
 function showMsg(text){
   statusMsg.textContent = text;
   statusMsg.classList.add('show');
-  setTimeout(()=>statusMsg.classList.remove('show'), 2600);
+  setTimeout(()=>statusMsg.classList.remove('show'), 3400);
 }
 
 function uid(){
@@ -354,12 +358,18 @@ async function deleteProjetoData(id){
 }
 
 // ---------- Image handling ----------
-// Compressão adaptativa: começa em alta qualidade e resolução maior,
-// e só reduz o necessário até caber com folga no limite de armazenamento.
-// Isso evita o erro que acontecia ao salvar fotos grandes.
-const IMG_MAX_DIM = 1600;      // resolução máxima (era 1000)
-const IMG_START_QUALITY = 0.85; // qualidade inicial (era 0.7)
-const IMG_MAX_BYTES = 700000;   // ~700KB por imagem, com folga para várias fotos por ficha
+// O armazenamento aceita no máximo ~5MB por chave, e cada ficha é salva
+// como UM ÚNICO registro (título + cliente + descrição + TODAS as imagens
+// juntas, em base64). Isso significa que o limite de 5MB é para a SOMA de
+// todas as imagens da ficha, não para cada imagem isolada — por isso o
+// orçamento abaixo é dividido/verificado em conjunto, com boa margem de
+// segurança para nunca estourar o limite real da plataforma.
+const IMG_MAX_DIM = 1400;        // resolução máxima (maior lado, em pixels)
+const IMG_START_QUALITY = 0.8;   // qualidade JPEG inicial (0 a 1)
+const IMG_MIN_QUALITY = 0.4;     // qualidade mínima antes de reduzir resolução
+const IMG_MAX_BYTES = 250000;    // ~320KB (decodificado) por imagem individual
+const RECORD_IMAGE_BUDGET = 3500000; // ~4.2MB (texto base64) para a SOMA das imagens de uma ficha
+const RECORD_SAFE_LIMIT = 4800000;   // ~4.8MB (texto base64) para a ficha inteira — margem abaixo do limite de 5MB da plataforma
 
 function loadImageFromFile(file){
   return new Promise((resolve, reject)=>{
@@ -376,7 +386,7 @@ function loadImageFromFile(file){
 }
 
 function estimateBytes(dataUrl){
-  // tamanho aproximado dos bytes reais de um data URL base64
+  // tamanho aproximado dos bytes reais (decodificados) de um data URL base64
   return Math.round(dataUrl.length * 0.75);
 }
 
@@ -396,7 +406,7 @@ async function compressImage(file){
   let dataUrl = '';
 
   // tenta até caber no limite: primeiro reduzindo qualidade, depois resolução
-  for(let attempt = 0; attempt < 8; attempt++){
+  for(let attempt = 0; attempt < 10; attempt++){
     const {nw, nh} = fit(maxDim);
     const canvas = document.createElement('canvas');
     canvas.width = nw; canvas.height = nh;
@@ -405,14 +415,32 @@ async function compressImage(file){
 
     if(estimateBytes(dataUrl) <= IMG_MAX_BYTES) return dataUrl;
 
-    if(quality > 0.5){
-      quality -= 0.12; // primeiro reduz qualidade
+    if(quality > IMG_MIN_QUALITY){
+      quality -= 0.1; // primeiro reduz qualidade
     }else{
       maxDim = Math.round(maxDim * 0.8); // depois reduz resolução
       quality = 0.6;
     }
   }
   return dataUrl; // melhor resultado obtido, mesmo que acima da meta
+}
+
+function totalPendingImageChars(){
+  return pendingImages.reduce((sum, src)=> sum + src.length, 0);
+}
+
+function updateBudgetBar(){
+  const used = totalPendingImageChars();
+  const pct = Math.min(100, Math.round((used / RECORD_IMAGE_BUDGET) * 100));
+  const fill = document.getElementById('budgetBarFill');
+  const hint = document.getElementById('budgetHint');
+  fill.style.width = pct + '%';
+  fill.classList.toggle('warn', pct >= 85);
+  const usedMB = (used/1000000).toFixed(1);
+  const totalMB = (RECORD_IMAGE_BUDGET/1000000).toFixed(1);
+  hint.textContent = pct >= 85
+    ? `Espaço quase no limite (${usedMB}MB de ${totalMB}MB) — evite adicionar mais imagens grandes.`
+    : `Espaço usado pelas imagens: ${usedMB}MB de ${totalMB}MB disponíveis.`;
 }
 
 function renderThumbs(){
@@ -428,16 +456,22 @@ function renderThumbs(){
       renderThumbs();
     });
   });
+  updateBudgetBar();
 }
 
 document.getElementById('fImagens').addEventListener('change', async e=>{
   const files = Array.from(e.target.files).slice(0, 8 - pendingImages.length);
   const saveBtn = document.getElementById('btnSave');
   let falhas = 0;
+  let estourou = 0;
   saveBtn.disabled = true;
   for(const file of files){
     try{
       const compressed = await compressImage(file);
+      if(totalPendingImageChars() + compressed.length > RECORD_IMAGE_BUDGET){
+        estourou++;
+        continue; // não deixa passar do orçamento total da ficha
+      }
       pendingImages.push(compressed);
       renderThumbs();
     }catch(err){
@@ -446,6 +480,7 @@ document.getElementById('fImagens').addEventListener('change', async e=>{
   }
   saveBtn.disabled = false;
   if(falhas > 0) showMsg(`${falhas} imagem(ns) não puderam ser processadas.`);
+  if(estourou > 0) showMsg(`${estourou} imagem(ns) não coube(ram) — o espaço desta ficha acabou. Remova alguma imagem para adicionar outra.`);
   e.target.value = '';
 });
 
@@ -621,6 +656,16 @@ async function saveProjeto(){
     descricao: document.getElementById('fDesc').value.trim(),
     imagens: [...pendingImages]
   };
+
+  // Confere o tamanho real do registro (título + descrição + todas as
+  // imagens juntas) ANTES de tentar salvar, para dar uma mensagem clara
+  // em vez de deixar a plataforma rejeitar o salvamento sem explicação.
+  const payloadSize = JSON.stringify(data).length;
+  if(payloadSize > RECORD_SAFE_LIMIT){
+    const mb = (payloadSize/1000000).toFixed(1);
+    showMsg(`Essa ficha ficou com ${mb}MB, acima do limite de armazenamento. Remova uma ou mais imagens e tente novamente.`);
+    return;
+  }
 
   const isNew = !id;
   try{
